@@ -82,6 +82,10 @@ class TrayApp(QSystemTrayIcon):
         self._dictation_buffer: list[np.ndarray] = []
         self._dictation_lock = threading.Lock()
 
+        # Contador de transcripciones pendientes en modo reunión
+        self._pending_segments = 0
+        self._pending_lock = threading.Lock()
+
         # Conectar señales
         self._signals.status_changed.connect(self._on_status_changed)
         self._signals.notification.connect(self._show_notification)
@@ -248,6 +252,8 @@ class TrayApp(QSystemTrayIcon):
 
     def _start_meeting(self):
         self._file_manager.start_session("meeting")
+        self._pending_segments = 0          # contador de transcripciones en curso
+        self._pending_lock = threading.Lock()
         self._vad_chunker = VADChunker(
             config=self._config,
             on_segment=self._on_meeting_segment,
@@ -265,25 +271,48 @@ class TrayApp(QSystemTrayIcon):
 
     def _on_meeting_segment(self, segment: np.ndarray):
         """Callback del VAD: transcribir y agregar al .md en tiempo real."""
-        result = self._transcriber.transcribe(segment, language=self._config.language)
-        if result and result.text.strip():
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            # Nota: no podemos distinguir MIC/SYSTEM desde VADChunker actualmente
-            # (el VAD procesa todo el audio mezclado)
-            self._file_manager.append_segment(None, timestamp, result.text)
+        # Incrementar contador de transcripciones pendientes
+        with self._pending_lock:
+            self._pending_segments += 1
+        try:
+            result = self._transcriber.transcribe(segment, language=self._config.language)
+            if result and result.text.strip():
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                self._file_manager.append_segment(None, timestamp, result.text)
+                print(f"[Meeting] Segmento transcripto: {result.text[:60]}...")
+        finally:
+            # Siempre decrementar, incluso si hay error
+            with self._pending_lock:
+                self._pending_segments -= 1
 
     def _stop_meeting(self):
         self._recorder.stop()
+
         if self._vad_chunker:
             self._vad_chunker.flush()
             self._vad_chunker = None
 
-        segment_count = self._file_manager.segment_count
-        final_path = self._file_manager.end_session()
+        # Esperar que todas las transcripciones pendientes terminen (máx 60s)
+        print("[Meeting] Esperando transcripciones pendientes...")
+        self._set_state(STATE_TRANSCRIBING)
 
-        msg = f"Reunión transcripta: {segment_count} segmentos"
-        self._signals.notification.emit("WhisperMate", msg)
-        self._set_state(STATE_IDLE)
+        def _wait_and_close():
+            import time
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                with self._pending_lock:
+                    if self._pending_segments <= 0:
+                        break
+                time.sleep(0.2)
+
+            segment_count = self._file_manager.segment_count
+            final_path = self._file_manager.end_session()
+            msg = f"Reunión transcripta: {segment_count} segmento(s) — {final_path.name}"
+            self._signals.notification.emit("WhisperMate", msg)
+            self._signals.transcription_done.emit("meeting", str(final_path))
+            self._signals.status_changed.emit(STATE_IDLE)
+
+        threading.Thread(target=_wait_and_close, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Watch folder
