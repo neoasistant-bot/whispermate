@@ -1,0 +1,10 @@
+faster-whisper>=1.0.0
+PyQt6>=6.6.0
+sounddevice>=0.4.6
+soundcard>=0.4.2
+silero-vad>=5.1.2
+watchdog>=4.0.0
+keyboard>=0.13.5
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy>=1.24.0

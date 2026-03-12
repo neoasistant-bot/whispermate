@@ -1,0 +1,14 @@
+{
+  "model": "small",
+  "language": "es",
+  "output_folder": "~/Transcripciones",
+  "watch_folder": "~/Transcripciones/inbox",
+  "watch_folder_enabled": false,
+  "shortcuts": {
+    "dictation": "ctrl+shift+r",
+    "meeting": "ctrl+shift+m"
+  },
+  "vad_threshold": 0.5,
+  "vad_min_silence_ms": 800,
+  "vad_chunk_padding_ms": 200
+}
