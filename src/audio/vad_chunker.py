@@ -1,5 +1,5 @@
 """
-VAD chunking con silero-vad.
+VAD chunking con silero-vad (modo onnxruntime, sin torch).
 Detecta segmentos de habla y emite chunks completos para transcripción.
 """
 
@@ -17,6 +17,8 @@ class VADChunker:
     """
     Acumula frames de audio y usa silero-vad para detectar segmentos de habla.
     Cuando se detecta fin de habla (silencio > min_silence_ms), llama on_segment.
+
+    Usa silero-vad v6 con backend onnxruntime (sin torch).
     """
 
     def __init__(self, config: Config, on_segment: Callable[[np.ndarray], None]):
@@ -25,7 +27,6 @@ class VADChunker:
         self._lock = threading.Lock()
 
         # Buffers
-        self._audio_buffer: list[np.ndarray] = []
         self._speech_buffer: list[np.ndarray] = []
 
         # Estado VAD
@@ -35,50 +36,45 @@ class VADChunker:
         # Parámetros
         self._threshold = config.vad_threshold
         self._min_silence_frames = int(config.vad_min_silence_ms * SAMPLE_RATE / 1000)
-        self._padding_frames = int(config.vad_chunk_padding_ms * SAMPLE_RATE / 1000)
 
-        # Cargar modelo (lazy)
+        # Cargar modelo silero-vad via onnxruntime (sin torch)
         self._model = None
+        self._iterator = None
         self._model_loaded = False
         self._load_model()
 
     def _load_model(self):
-        """Carga el modelo silero-vad desde torch.hub."""
+        """Carga el modelo silero-vad con backend onnx (no requiere torch)."""
         try:
-            import torch
-            # Suprimir output de torch.hub
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                self._model, _ = torch.hub.load(
-                    repo_or_dir="snakers4/silero-vad",
-                    model="silero_vad",
-                    force_reload=False,
-                    trust_repo=True,
-                )
-            self._model.eval()
+            from silero_vad import load_silero_vad, VADIterator
+            # onnx=True usa onnxruntime en lugar de torch
+            self._model = load_silero_vad(onnx=True)
+            self._iterator = VADIterator(
+                self._model,
+                threshold=self._threshold,
+                sampling_rate=SAMPLE_RATE,
+                min_silence_duration_ms=self._config.vad_min_silence_ms,
+                speech_pad_ms=self._config.vad_chunk_padding_ms,
+            )
             self._model_loaded = True
-            print("[VAD] Modelo silero-vad cargado.")
+            print("[VAD] Modelo silero-vad cargado (onnxruntime).")
         except Exception as e:
-            print(f"[VAD] No se pudo cargar silero-vad: {e}. VAD desactivado.")
+            print(f"[VAD] No se pudo cargar silero-vad: {e}. VAD desactivado (pass-through).")
             self._model_loaded = False
 
-    def _run_vad(self, audio_frame: np.ndarray) -> float:
-        """Corre VAD en un frame. Retorna probabilidad de voz (0.0-1.0)."""
-        if not self._model_loaded:
-            # Sin VAD: asumir que siempre hay habla
-            return 1.0
+    def _run_vad(self, audio_frame: np.ndarray) -> Optional[dict]:
+        """
+        Corre VAD en un frame con VADIterator.
+        Retorna dict con 'start'/'end' en samples si hay evento, None si no.
+        """
+        if not self._model_loaded or self._iterator is None:
+            return None
         try:
-            import torch
-            tensor = torch.FloatTensor(audio_frame)
-            if tensor.dim() == 1:
-                tensor = tensor.unsqueeze(0)
-            with torch.no_grad():
-                prob = self._model(tensor, SAMPLE_RATE).item()
-            return prob
-        except Exception as e:
-            print(f"[VAD] Error en inferencia: {e}")
-            return 0.0
+            # VADIterator espera tensor de float32
+            result = self._iterator(audio_frame, return_seconds=False)
+            return result
+        except Exception:
+            return None
 
     def feed(self, audio_frame: np.ndarray) -> None:
         """
@@ -86,55 +82,51 @@ class VADChunker:
         Llama on_segment cuando detecta fin de habla.
         """
         with self._lock:
-            prob = self._run_vad(audio_frame)
-            is_voice = prob >= self._threshold
-
-            if is_voice:
-                if not self._is_speaking:
-                    # Inicio de segmento: agregar padding previo si hay
-                    self._is_speaking = True
-                    print(f"[VAD] Inicio de habla (prob={prob:.2f})")
-                self._silence_frames = 0
+            if not self._model_loaded:
+                # Sin VAD: acumular todo y emitir chunks de 5s
                 self._speech_buffer.append(audio_frame.copy())
-            else:
-                if self._is_speaking:
-                    self._silence_frames += len(audio_frame)
-                    self._speech_buffer.append(audio_frame.copy())  # incluir silencio post
+                total = sum(len(f) for f in self._speech_buffer)
+                if total >= SAMPLE_RATE * 5:
+                    segment = np.concatenate(self._speech_buffer)
+                    self._speech_buffer = []
+                    threading.Thread(target=self._on_segment, args=(segment,), daemon=True).start()
+                return
 
-                    if self._silence_frames >= self._min_silence_frames:
-                        # Fin de segmento
-                        self._is_speaking = False
-                        segment = np.concatenate(self._speech_buffer)
-                        self._speech_buffer = []
-                        self._silence_frames = 0
-                        print(f"[VAD] Fin de habla. Segmento: {len(segment)/SAMPLE_RATE:.1f}s")
-                        # Llamar callback fuera del lock
-                        threading.Thread(
-                            target=self._on_segment,
-                            args=(segment,),
-                            daemon=True,
-                        ).start()
+            event = self._run_vad(audio_frame)
+            self._speech_buffer.append(audio_frame.copy())
+
+            if event:
+                if 'start' in event:
+                    self._is_speaking = True
+                    print(f"[VAD] Inicio de habla")
+
+                if 'end' in event and self._is_speaking:
+                    self._is_speaking = False
+                    segment = np.concatenate(self._speech_buffer)
+                    self._speech_buffer = []
+                    print(f"[VAD] Fin de habla. Segmento: {len(segment)/SAMPLE_RATE:.1f}s")
+                    threading.Thread(target=self._on_segment, args=(segment,), daemon=True).start()
 
     def flush(self) -> None:
         """Fuerza el procesamiento del buffer pendiente (al detener grabación)."""
         with self._lock:
-            if self._speech_buffer:
+            if self._speech_buffer and self._is_speaking:
                 segment = np.concatenate(self._speech_buffer)
                 self._speech_buffer = []
                 self._is_speaking = False
                 self._silence_frames = 0
-                if len(segment) > SAMPLE_RATE * 0.1:  # mínimo 100ms
+                if len(segment) > SAMPLE_RATE * 0.1:
                     print(f"[VAD] Flush: emitiendo segmento de {len(segment)/SAMPLE_RATE:.1f}s")
-                    threading.Thread(
-                        target=self._on_segment,
-                        args=(segment,),
-                        daemon=True,
-                    ).start()
+                    threading.Thread(target=self._on_segment, args=(segment,), daemon=True).start()
+            # Reset iterator para próxima sesión
+            if self._model_loaded and self._iterator is not None:
+                self._iterator.reset_states()
 
     def reset(self) -> None:
         """Resetea el estado interno."""
         with self._lock:
-            self._audio_buffer = []
             self._speech_buffer = []
             self._is_speaking = False
             self._silence_frames = 0
+            if self._model_loaded and self._iterator is not None:
+                self._iterator.reset_states()
