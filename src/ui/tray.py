@@ -33,9 +33,13 @@ STATE_TRANSCRIBING = "transcribing"
 class _Signals(QObject):
     """Señales Qt para comunicación entre threads."""
     status_changed = pyqtSignal(str)
-    notification = pyqtSignal(str, str)   # title, message
+    notification = pyqtSignal(str, str)       # title, message
     transcription_done = pyqtSignal(str, str)  # mode, filepath
+    copy_to_clipboard = pyqtSignal(str)        # texto a copiar
     error = pyqtSignal(str)
+    # Señal para ejecutar toggle en el hilo Qt (desde callbacks del keyboard)
+    trigger_dictation = pyqtSignal()
+    trigger_meeting = pyqtSignal()
 
 
 def _make_icon(color: str, size: int = 22) -> QIcon:
@@ -86,11 +90,16 @@ class TrayApp(QSystemTrayIcon):
         self._pending_segments = 0
         self._pending_lock = threading.Lock()
 
-        # Conectar señales
+        # Conectar señales (todas se ejecutan en el hilo Qt principal)
         self._signals.status_changed.connect(self._on_status_changed)
         self._signals.notification.connect(self._show_notification)
         self._signals.transcription_done.connect(self._on_transcription_done)
+        self._signals.copy_to_clipboard.connect(self._do_clipboard_copy)
         self._signals.error.connect(self._on_error)
+        # Estas dos señales permiten que el callback del keyboard (thread de fondo)
+        # ejecute los toggles en el hilo Qt, evitando crashes en Windows.
+        self._signals.trigger_dictation.connect(self.toggle_dictation)
+        self._signals.trigger_meeting.connect(self.toggle_meeting)
 
         # Construir UI
         self._build_menu()
@@ -106,6 +115,31 @@ class TrayApp(QSystemTrayIcon):
         # Iniciar watch folder si está habilitado
         if config.watch_folder_enabled:
             self._start_watcher()
+
+        # Pre-cargar el modelo en background para que el primer uso sea rápido
+        threading.Thread(target=self._preload_model, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Pre-carga del modelo
+    # ------------------------------------------------------------------
+
+    def _preload_model(self):
+        """Carga el modelo faster-whisper en background al iniciar."""
+        self._signals.notification.emit(
+            "WhisperMate",
+            f"⏳ Cargando modelo '{self._config.model}'... (primera vez puede tardar)"
+        )
+        ok = self._transcriber.preload()
+        if ok:
+            self._signals.notification.emit(
+                "WhisperMate",
+                f"✅ Modelo '{self._config.model}' listo."
+            )
+        else:
+            self._signals.notification.emit(
+                "WhisperMate",
+                "⚠️ No se pudo cargar el modelo. Verificá los logs."
+            )
 
     # ------------------------------------------------------------------
     # Menú
@@ -168,16 +202,33 @@ class TrayApp(QSystemTrayIcon):
     # ------------------------------------------------------------------
 
     def _register_hotkeys(self):
-        """Registra los hotkeys globales con la librería keyboard."""
+        """
+        Registra hotkeys globales con la librería keyboard.
+        IMPORTANTE: los callbacks del keyboard se ejecutan en un hilo de fondo
+        (no en el hilo Qt). Por eso usamos señales Qt para disparar los toggles
+        en el hilo principal, lo que evita crashes en Windows con WASAPI.
+        """
         try:
             import keyboard
             shortcuts = self._config.shortcuts
-            keyboard.add_hotkey(shortcuts.get("dictation", "ctrl+shift+r"), self.toggle_dictation)
-            keyboard.add_hotkey(shortcuts.get("meeting", "ctrl+shift+m"), self.toggle_meeting)
+
+            # Usamos emit() de señales Qt (thread-safe) en lugar de llamar
+            # directamente a toggle_dictation/toggle_meeting desde el callback.
+            keyboard.add_hotkey(
+                shortcuts.get("dictation", "ctrl+shift+r"),
+                lambda: self._signals.trigger_dictation.emit(),
+                suppress=False,
+            )
+            keyboard.add_hotkey(
+                shortcuts.get("meeting", "ctrl+shift+m"),
+                lambda: self._signals.trigger_meeting.emit(),
+                suppress=False,
+            )
             print(f"[Tray] Hotkeys registrados: {shortcuts}")
         except Exception as e:
             print(f"[Tray] No se pudieron registrar hotkeys: {e}")
             print("[Tray] Tip: en Linux puede requerir permisos de root o grupo 'input'.")
+            print("[Tray] Tip: en Windows, intentá ejecutar como Administrador.")
 
     def _unregister_hotkeys(self):
         try:
@@ -201,6 +252,7 @@ class TrayApp(QSystemTrayIcon):
         try:
             self._recorder.start_mic_only(callback=self._dictation_audio_callback)
             self._set_state(STATE_DICTATING)
+            self._signals.notification.emit("WhisperMate", "🎤 Grabando dictado... (Ctrl+Shift+R para detener)")
         except RuntimeError as e:
             self._signals.error.emit(str(e))
 
@@ -214,6 +266,7 @@ class TrayApp(QSystemTrayIcon):
 
         with self._dictation_lock:
             if not self._dictation_buffer:
+                self._signals.error.emit("No se grabó audio.")
                 self._set_state(STATE_IDLE)
                 return
             audio = np.concatenate(self._dictation_buffer)
@@ -232,10 +285,14 @@ class TrayApp(QSystemTrayIcon):
             self._signals.status_changed.emit(STATE_IDLE)
             return
 
-        filepath = self._file_manager.start_session("dictation")
+        # Guardar al archivo .md
+        self._file_manager.start_session("dictation")
         timestamp = datetime.now().strftime("%H:%M:%S")
         self._file_manager.append_segment(None, timestamp, result.text)
         final_path = self._file_manager.end_session()
+
+        # Copiar texto al portapapeles (se ejecuta en hilo Qt via señal)
+        self._signals.copy_to_clipboard.emit(result.text)
 
         self._signals.transcription_done.emit("dictation", str(final_path))
         self._signals.status_changed.emit(STATE_IDLE)
@@ -252,7 +309,7 @@ class TrayApp(QSystemTrayIcon):
 
     def _start_meeting(self):
         self._file_manager.start_session("meeting")
-        self._pending_segments = 0          # contador de transcripciones en curso
+        self._pending_segments = 0
         self._pending_lock = threading.Lock()
         self._vad_chunker = VADChunker(
             config=self._config,
@@ -261,6 +318,7 @@ class TrayApp(QSystemTrayIcon):
         try:
             self._recorder.start_meeting(callback=self._meeting_audio_callback)
             self._set_state(STATE_MEETING)
+            self._signals.notification.emit("WhisperMate", "👥 Grabando reunión... (Ctrl+Shift+M para detener)")
         except RuntimeError as e:
             self._file_manager.end_session()
             self._signals.error.emit(str(e))
@@ -271,7 +329,6 @@ class TrayApp(QSystemTrayIcon):
 
     def _on_meeting_segment(self, segment: np.ndarray):
         """Callback del VAD: transcribir y agregar al .md en tiempo real."""
-        # Incrementar contador de transcripciones pendientes
         with self._pending_lock:
             self._pending_segments += 1
         try:
@@ -281,7 +338,6 @@ class TrayApp(QSystemTrayIcon):
                 self._file_manager.append_segment(None, timestamp, result.text)
                 print(f"[Meeting] Segmento transcripto: {result.text[:60]}...")
         finally:
-            # Siempre decrementar, incluso si hay error
             with self._pending_lock:
                 self._pending_segments -= 1
 
@@ -292,7 +348,6 @@ class TrayApp(QSystemTrayIcon):
             self._vad_chunker.flush()
             self._vad_chunker = None
 
-        # Esperar que todas las transcripciones pendientes terminen (máx 60s)
         print("[Meeting] Esperando transcripciones pendientes...")
         self._set_state(STATE_TRANSCRIBING)
 
@@ -355,10 +410,35 @@ class TrayApp(QSystemTrayIcon):
     def _show_notification(self, title: str, message: str):
         self.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 4000)
 
+    def _do_clipboard_copy(self, text: str):
+        """
+        Copia texto al portapapeles. Se ejecuta en el hilo Qt principal.
+        Intenta pyperclip primero (más compatible con Windows), fallback a Qt.
+        """
+        try:
+            import pyperclip
+            pyperclip.copy(text)
+            print(f"[Tray] Texto copiado al portapapeles ({len(text)} chars) via pyperclip")
+        except Exception as e:
+            print(f"[Tray] pyperclip falló ({e}), usando Qt clipboard...")
+            try:
+                clipboard = QApplication.clipboard()
+                if clipboard:
+                    clipboard.setText(text)
+                    print(f"[Tray] Texto copiado al portapapeles ({len(text)} chars) via Qt")
+            except Exception as e2:
+                print(f"[Tray] Error copiando al portapapeles: {e2}")
+
     def _on_transcription_done(self, mode: str, filepath: str):
         from pathlib import Path
         filename = Path(filepath).name
-        self._show_notification("WhisperMate", f"✅ Transcripción guardada: {filename}")
+        if mode == "dictation":
+            self._show_notification(
+                "WhisperMate",
+                f"✅ Transcripción copiada al portapapeles y guardada en: {filename}"
+            )
+        else:
+            self._show_notification("WhisperMate", f"✅ Transcripción guardada: {filename}")
 
     def _on_error(self, message: str):
         self._show_notification("WhisperMate — Error", f"❌ {message}")
@@ -385,12 +465,12 @@ class TrayApp(QSystemTrayIcon):
 
     def _open_settings(self):
         from src.ui.settings_window import SettingsWindow
-        was_idle = self._state == STATE_IDLE
         dialog = SettingsWindow(self._config)
         if dialog.exec() and dialog.saved:
             # Recargar transcriber si cambió el modelo
             if self._transcriber.model_name != self._config.model:
                 self._transcriber.change_model(self._config.model)
+                threading.Thread(target=self._preload_model, daemon=True).start()
 
             # Re-registrar hotkeys
             self._unregister_hotkeys()
@@ -411,7 +491,6 @@ class TrayApp(QSystemTrayIcon):
     # ------------------------------------------------------------------
 
     def _quit(self):
-        # Limpiar
         if self._recorder.is_recording:
             self._recorder.stop()
         if self._watcher:

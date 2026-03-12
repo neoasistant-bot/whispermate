@@ -64,6 +64,11 @@ class Transcriber:
             self._model = None
             return False
 
+    def preload(self) -> bool:
+        """Precarga el modelo explícitamente (útil para evitar delay en primer uso)."""
+        with self._lock:
+            return self._load_model()
+
     def change_model(self, model_name: str) -> None:
         """Cambia el modelo. Se recargará en la próxima transcripción."""
         if model_name not in VALID_MODELS:
