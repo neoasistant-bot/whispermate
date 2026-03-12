@@ -52,12 +52,8 @@ def _make_icon(color: str, size: int = 22) -> QIcon:
     return QIcon(pixmap)
 
 
-ICONS = {
-    STATE_IDLE: _make_icon("#888888"),
-    STATE_DICTATING: _make_icon("#22cc55"),
-    STATE_MEETING: _make_icon("#cc2222"),
-    STATE_TRANSCRIBING: _make_icon("#f5a623"),
-}
+# Los íconos se crean en TrayApp.__init__() después de que QApplication existe.
+ICONS: dict = {}
 
 
 class TrayApp(QSystemTrayIcon):
@@ -66,6 +62,14 @@ class TrayApp(QSystemTrayIcon):
         self._config = config
         self._state = STATE_IDLE
         self._signals = _Signals()
+
+        # Crear íconos ahora que QApplication ya existe
+        ICONS.update({
+            STATE_IDLE: _make_icon("#888888"),
+            STATE_DICTATING: _make_icon("#22cc55"),
+            STATE_MEETING: _make_icon("#cc2222"),
+            STATE_TRANSCRIBING: _make_icon("#f5a623"),
+        })
 
         # Componentes
         self._recorder = AudioRecorder()
